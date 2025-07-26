@@ -1,31 +1,31 @@
 import { createWorker } from "mediasoup";
-
 import type {
   Worker,
   Router,
   WebRtcTransport,
-  RouterOptions,
   WebRtcTransportOptions,
   DtlsParameters,
   RtpParameters,
   MediaKind,
   Producer,
+  Consumer,
 } from "mediasoup/node/lib/types";
+
 let worker: Worker;
 let router: Router;
 
-export async function startMediasoup() {  
+export async function startMediasoup() {
   worker = await createWorker({
     rtcMinPort: 20000,
     rtcMaxPort: 20200,
   });
 
   worker.on("died", () => {
-    console.error("Mediasoup worker died. Restarting in 2 seconds...");
+    console.error("Mediasoup worker died. Restarting...");
     setTimeout(() => process.exit(1), 2000);
   });
 
-  console.log("Mediasoup Worker created ✅");
+  console.log("✅ Mediasoup worker created");
 
   router = await worker.createRouter({
     mediaCodecs: [
@@ -39,12 +39,11 @@ export async function startMediasoup() {
         kind: "video",
         mimeType: "video/VP8",
         clockRate: 90000,
-        parameters: {},
       },
     ],
   });
 
-  console.log("Mediasoup Router created ✅");
+  console.log("✅ Mediasoup router created");
 }
 
 export function getRouter() {
@@ -53,7 +52,7 @@ export function getRouter() {
 
 const transports = new Map<string, WebRtcTransport>();
 const producers = new Map<string, Producer>();
-
+const consumers = new Map<string, Consumer>();
 
 const transportOptions: WebRtcTransportOptions = {
   listenIps: [{ ip: "127.0.0.1", announcedIp: "127.0.0.1" }],
@@ -63,29 +62,14 @@ const transportOptions: WebRtcTransportOptions = {
   initialAvailableOutgoingBitrate: 1000000,
 };
 
-export async function createWebRtcTransport(socketId: string): Promise<{
-  transport: WebRtcTransport;
-  params: {
-    id: string;
-    iceParameters: any;
-    iceCandidates: any;
-    dtlsParameters: any;
-  };
-}> {
-  const router = getRouter();
+// Shared helper
+function getTransport(socketId: string) {
+  return transports.get(socketId);
+}
+
+export async function createWebRtcTransport(socketId: string, direction: 'send' | 'recv') {
   const transport = await router.createWebRtcTransport(transportOptions);
-  console.log("Transport started")
-  transports.set(socketId, transport);
-
-  transport.on("dtlsstatechange", (state) => {
-    if (state === "closed") {
-      transport.close();
-    }
-  });
-
-  transport.on("@close", () => {
-    console.log("Transport closed");
-  });
+  transports.set(`${socketId}-${direction}`, transport);
 
   return {
     transport,
@@ -98,27 +82,50 @@ export async function createWebRtcTransport(socketId: string): Promise<{
   };
 }
 
-
-export function getTransport(socketId: string) {
-  return transports.get(socketId);
-}
-
-export async function connectTransport(socketId: string, dtlsParameters: DtlsParameters) {
-  const transport = getTransport(socketId);
+export async function connectTransport(socketId: string, dtlsParameters: DtlsParameters, direction: 'send' | 'recv') {
+  const transport = transports.get(`${socketId}-${direction}`);
   if (!transport) throw new Error("Transport not found");
   await transport.connect({ dtlsParameters });
 }
 
-export async function createProducer(
-  socketId: string,
-  kind: MediaKind,
-  rtpParameters: RtpParameters
-): Promise<{ id: string }> {
-  const transport = getTransport(socketId);
-  if (!transport) throw new Error("Transport not found");
+export async function createProducer(socketId: string, kind: MediaKind, rtpParameters: RtpParameters) {
+  const transport = transports.get(`${socketId}-send`);
+  if (!transport) throw new Error("Send transport not found");
 
   const producer = await transport.produce({ kind, rtpParameters });
   producers.set(socketId, producer);
 
   return { id: producer.id };
+}
+
+export async function createConsumer(consumerSocketId: string, producerSocketId: string) {
+  const producer = producers.get(producerSocketId);
+  if (!producer) throw new Error("Producer not found");
+
+  const transport = transports.get(`${consumerSocketId}-recv`);
+  if (!transport) throw new Error("Recv transport not found");
+
+  const consumer = await transport.consume({
+    producerId: producer.id,
+    rtpCapabilities: router.rtpCapabilities,
+    paused: false,
+  });
+
+  consumers.set(`${consumerSocketId}-${producerSocketId}`, consumer);
+
+  return {
+    id: consumer.id,
+    producerId: producer.id,
+    kind: consumer.kind,
+    rtpParameters: consumer.rtpParameters,
+  };
+}
+export function getAllProducersExcept(socketId: string) {
+  const others = [];
+  for (const [id, producer] of producers.entries()) {
+    if (id !== socketId) {
+      others.push({ socketId: id });
+    }
+  }
+  return others;
 }

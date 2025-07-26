@@ -1,10 +1,7 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Device, types as mediasoupTypes } from 'mediasoup-client';
 import type {
   RtpCapabilities,
-  Transport,
-  DtlsParameters,
-  MediaKind,
   RtpParameters,
 } from 'mediasoup-client/types';
 import { useSocket } from '../lib/SocketProvider';
@@ -12,119 +9,105 @@ import { useSocket } from '../lib/SocketProvider';
 function Stream() {
   const socket = useSocket();
   const localVideoRef = useRef<HTMLVideoElement>(null);
-  const [device, setDevice] = useState<Device | null>(null);
-
-  // Load the mediasoup device
-  const loadDevice = async (): Promise<Device> => {
-    return new Promise((resolve) => {
-      socket?.emit(
-        'get-rtp-capabilities',
-        {},
-        async (rtpCapabilities: RtpCapabilities) => {
-          const dev = new Device();
-          await dev.load({ routerRtpCapabilities: rtpCapabilities });
-          resolve(dev);
-        }
-      );
-    });
-  };
-
-  // Create the send transport
-  const createSendTransport = async (device: Device): Promise<Transport> => {
-    return new Promise((resolve, reject) => {
-      socket?.emit(
-        'create-send-transport',
-        {},
-        async ({
-          params,
-          error,
-        }: {
-          params: mediasoupTypes.TransportOptions;
-          error?: string;
-        }) => {
-          if (error) return reject(error);
-
-          const transport = device.createSendTransport(params);
-
-          // Connect DTLS
-          transport.on(
-            'connect',
-            (
-              { dtlsParameters }: { dtlsParameters: DtlsParameters },
-              callback,
-              errback
-            ) => {
-              socket.emit(
-                'connect-transport',
-                { dtlsParameters, transportId: transport.id },
-                () => {
-                  callback();
-                }
-              );
-            }
-          );
-
-          // Produce media
-          transport.on(
-            'produce',
-            (
-              {
-                kind,
-                rtpParameters,
-              }: { kind: MediaKind; rtpParameters: RtpParameters },
-              callback,
-              errback
-            ) => {
-              socket.emit(
-                'produce',
-                {
-                  kind,
-                  rtpParameters,
-                  transportId: transport.id,
-                },
-                ({ id }: { id: string }) => {
-                  callback({ id });
-                }
-              );
-            }
-          );
-
-          resolve(transport);
-        }
-      );
-    });
-  };
-
-  // Get camera/mic
-  const getMediaStream = async () => {
-    return navigator.mediaDevices.getUserMedia({
-      video: true,
-      audio: true,
-    });
-  };
+  const remoteVideosRef = useRef<Map<string, HTMLVideoElement>>(new Map());
+  const [, setDevice] = useState<mediasoupTypes.Device | null>(null);
 
   useEffect(() => {
-    const startStreaming = async () => {
+    const start = async () => {
       if (!socket) return;
 
-      const device = await loadDevice();
-      setDevice(device);
+      const dev = new Device();
+      const rtpCapabilities: RtpCapabilities = await new Promise((res) =>
+        socket.emit('get-rtp-capabilities', {}, res)
+      );
+      await dev.load({ routerRtpCapabilities: rtpCapabilities });
+      setDevice(dev);
 
-      const transport = await createSendTransport(device);
-      const stream = await getMediaStream();
+      // Create Send Transport
+      const { params: sendParams } = await new Promise<{
+        params: mediasoupTypes.TransportOptions;
+      }>((res) => socket.emit('create-send-transport', {}, res));
 
-      // Attach stream to local video
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
-      }
+      const sendTransport = dev.createSendTransport(sendParams);
 
-      // Send tracks
+      sendTransport.on('connect', ({ dtlsParameters }, callback) => {
+        socket.emit('connect-transport', { dtlsParameters, direction: 'send' }, callback);
+      });
+
+      sendTransport.on('produce', ({ kind, rtpParameters }, callback) => {
+        socket.emit('produce', { kind, rtpParameters }, ({ id }: { id: string }) => {
+          callback({ id });
+        });
+      });
+
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+
       for (const track of stream.getTracks()) {
-        await transport.produce({ track });
+        await sendTransport.produce({ track });
       }
+
+      // Function to consume a remote producer
+      const consumeRemoteProducer = async (producerSocketId: string) => {
+        const { params: recvParams } = await new Promise<{
+          params: mediasoupTypes.TransportOptions;
+        }>((res) => socket.emit('create-recv-transport', {}, res));
+
+        const recvTransport = dev.createRecvTransport(recvParams);
+
+        recvTransport.on('connect', ({ dtlsParameters }, callback) => {
+          socket.emit('connect-transport', { dtlsParameters, direction: 'recv' }, callback);
+        });
+
+        const consumerOptions = await new Promise<{
+          id: string;
+          producerId: string;
+          kind: mediasoupTypes.MediaKind;
+          rtpParameters: RtpParameters;
+          error?: string;
+        }>((res) => socket.emit('consume', { producerSocketId }, res));
+
+        if (consumerOptions.error) {
+          console.warn('Error consuming', consumerOptions.error);
+          return;
+        }
+
+        const consumer = await recvTransport.consume({
+          id: consumerOptions.id,
+          producerId: consumerOptions.producerId,
+          kind: consumerOptions.kind,
+          rtpParameters: consumerOptions.rtpParameters,
+        });
+
+        const track = consumer.track;
+        if (track) {
+          const remoteStream = new MediaStream([track]);
+          const videoElem = document.createElement('video');
+          videoElem.srcObject = remoteStream;
+          videoElem.autoplay = true;
+          videoElem.playsInline = true;
+          videoElem.muted = false;
+          videoElem.style.width = '300px';
+          document.body.appendChild(videoElem);
+          remoteVideosRef.current.set(producerSocketId, videoElem);
+        }
+      };
+
+      // ✅ Fix: expect a list of socket IDs, not objects
+      const existingProducers: string[] = await new Promise((res) =>
+        socket.emit('get-producers', {}, res)
+      );
+
+      for (const producerSocketId of existingProducers) {
+        await consumeRemoteProducer(producerSocketId);
+      }
+
+      socket.on('new-producer', async ({ producerSocketId }: { producerSocketId: string }) => {
+        await consumeRemoteProducer(producerSocketId);
+      });
     };
 
-    startStreaming();
+    start();
   }, [socket]);
 
   return (
