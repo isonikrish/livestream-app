@@ -24,6 +24,7 @@ A real-time, multi-user video calling platform – simple, secure, and developer
 ---
 
 ## 📸 Screenshots
-(./client/public/img1.png)
-(./client/public/img2.png)
+![Screenshot 1](./client/public/img1.png)
+![Screenshot 2](./client/public/img2.png)
+
 
