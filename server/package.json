@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "cors": "^2.8.5",
+    "mediasoup": "^3.16.8",
     "socket.io": "^4.8.1"
   }
 }

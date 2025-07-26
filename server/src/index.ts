@@ -3,6 +3,8 @@ import http from "http";
 import express from "express";
 import cors from "cors";
 import listener from "./lib/listener";
+import { startMediasoup } from "./mediasoup/mediasoupServer";
+
 const app = express();
 const server = http.createServer(app);
 const PORT = 4000;
@@ -23,7 +25,7 @@ app.use(express.json());
 app.get("/", (req: any, res: any) => {
   res.send("Hello!");
 });
-
+startMediasoup()
 listener(io);
 
 
